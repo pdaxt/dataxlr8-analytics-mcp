@@ -4,7 +4,59 @@ use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{error, info, warn};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_LIMIT: i64 = 100;
+const MAX_LIMIT: i64 = 1000;
+const DEFAULT_TOP_LIMIT: i64 = 10;
+const MAX_TOP_LIMIT: i64 = 100;
+const DEFAULT_JOURNEY_LIMIT: i64 = 500;
+const MAX_JOURNEY_LIMIT: i64 = 5000;
+const DEFAULT_EXPORT_LIMIT: i64 = 10000;
+const MAX_EXPORT_LIMIT: i64 = 50000;
+const MAX_RETENTION_DAYS: i64 = 30;
+const DEFAULT_RETENTION_DAYS: i64 = 7;
+const MAX_STRING_LEN: usize = 500;
+const MAX_EVENT_TYPE_LEN: usize = 100;
+
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
+/// Trim a string input and return None if it becomes empty.
+fn trim_str(args: &serde_json::Value, key: &str) -> Option<String> {
+    get_str(args, key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Validate a date string is in YYYY-MM-DD format.
+fn validate_date(date: &str) -> Result<(), String> {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|_| ())
+        .map_err(|_| format!("Invalid date format '{}'. Expected YYYY-MM-DD.", date))
+}
+
+/// Validate a string doesn't exceed a maximum length.
+fn validate_length(value: &str, field: &str, max: usize) -> Result<(), String> {
+    if value.len() > max {
+        Err(format!("{field} exceeds maximum length of {max} characters"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Clamp a limit value to [1, max] with a default.
+fn clamp_limit(args: &serde_json::Value, default: i64, max: i64) -> i64 {
+    get_i64(args, "limit").unwrap_or(default).max(1).min(max)
+}
+
+/// Get offset, defaulting to 0 and clamping to >= 0.
+fn get_offset(args: &serde_json::Value) -> i64 {
+    get_i64(args, "offset").unwrap_or(0).max(0)
+}
 
 // ============================================================================
 // Data types
@@ -77,7 +129,7 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "query_events".into(),
             title: None,
-            description: Some("Filter events by type, date range, user_id, session_id. Returns matching events.".into()),
+            description: Some("Filter events by type, date range, user_id, session_id. Returns matching events with pagination.".into()),
             input_schema: make_schema(
                 serde_json::json!({
                     "event_type": { "type": "string", "description": "Filter by event type" },
@@ -85,7 +137,8 @@ fn build_tools() -> Vec<Tool> {
                     "session_id": { "type": "string", "description": "Filter by session ID" },
                     "start_date": { "type": "string", "description": "Start date (YYYY-MM-DD)" },
                     "end_date": { "type": "string", "description": "End date (YYYY-MM-DD)" },
-                    "limit": { "type": "integer", "description": "Max results (default 100)" }
+                    "limit": { "type": "integer", "description": "Max results (default 100, max 1000)" },
+                    "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
                 }),
                 vec![],
             ),
@@ -116,12 +169,14 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "daily_metrics".into(),
             title: None,
-            description: Some("Aggregate counts by event type per day. Returns daily_aggregates rows.".into()),
+            description: Some("Aggregate counts by event type per day with pagination. Returns daily_aggregates rows.".into()),
             input_schema: make_schema(
                 serde_json::json!({
                     "event_type": { "type": "string", "description": "Filter by event type (optional, all types if omitted)" },
                     "start_date": { "type": "string", "description": "Start date (YYYY-MM-DD)" },
-                    "end_date": { "type": "string", "description": "End date (YYYY-MM-DD)" }
+                    "end_date": { "type": "string", "description": "End date (YYYY-MM-DD)" },
+                    "limit": { "type": "integer", "description": "Max results (default 100, max 1000)" },
+                    "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
                 }),
                 vec![],
             ),
@@ -139,7 +194,8 @@ fn build_tools() -> Vec<Tool> {
                 serde_json::json!({
                     "start_date": { "type": "string", "description": "Start date (YYYY-MM-DD)" },
                     "end_date": { "type": "string", "description": "End date (YYYY-MM-DD)" },
-                    "limit": { "type": "integer", "description": "Number of top events (default 10)" }
+                    "limit": { "type": "integer", "description": "Number of top events (default 10, max 100)" },
+                    "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
                 }),
                 vec![],
             ),
@@ -152,13 +208,14 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "user_journey".into(),
             title: None,
-            description: Some("All events for a specific user/contact in chronological order.".into()),
+            description: Some("All events for a specific user/contact in chronological order with pagination.".into()),
             input_schema: make_schema(
                 serde_json::json!({
                     "user_id": { "type": "string", "description": "The user/contact ID to get journey for" },
                     "start_date": { "type": "string", "description": "Start date (YYYY-MM-DD)" },
                     "end_date": { "type": "string", "description": "End date (YYYY-MM-DD)" },
-                    "limit": { "type": "integer", "description": "Max events (default 500)" }
+                    "limit": { "type": "integer", "description": "Max events (default 500, max 5000)" },
+                    "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
                 }),
                 vec!["user_id"],
             ),
@@ -176,7 +233,7 @@ fn build_tools() -> Vec<Tool> {
                 serde_json::json!({
                     "start_date": { "type": "string", "description": "Cohort start date (YYYY-MM-DD)" },
                     "end_date": { "type": "string", "description": "Cohort end date (YYYY-MM-DD)" },
-                    "max_days": { "type": "integer", "description": "Max days to track retention (default 7)" }
+                    "max_days": { "type": "integer", "description": "Max days to track retention (default 7, max 30)" }
                 }),
                 vec![],
             ),
@@ -189,13 +246,15 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "export_events".into(),
             title: None,
-            description: Some("Export filtered events as JSON array. Same filters as query_events but no limit cap.".into()),
+            description: Some("Export filtered events as JSON array with pagination.".into()),
             input_schema: make_schema(
                 serde_json::json!({
                     "event_type": { "type": "string", "description": "Filter by event type" },
                     "user_id": { "type": "string", "description": "Filter by user ID" },
                     "start_date": { "type": "string", "description": "Start date (YYYY-MM-DD)" },
-                    "end_date": { "type": "string", "description": "End date (YYYY-MM-DD)" }
+                    "end_date": { "type": "string", "description": "End date (YYYY-MM-DD)" },
+                    "limit": { "type": "integer", "description": "Max results (default 10000, max 50000)" },
+                    "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
                 }),
                 vec![],
             ),
@@ -225,12 +284,31 @@ impl AnalyticsMcpServer {
     // ---- Tool handlers ----
 
     async fn handle_track_event(&self, args: &serde_json::Value) -> CallToolResult {
-        let event_type = match get_str(args, "event_type") {
+        let event_type = match trim_str(args, "event_type") {
             Some(t) => t,
-            None => return error_result("Missing required parameter: event_type"),
+            None => {
+                warn!("track_event called without event_type");
+                return error_result("Missing required parameter: event_type");
+            }
         };
-        let user_id = get_str(args, "user_id");
-        let session_id = get_str(args, "session_id");
+        if let Err(e) = validate_length(&event_type, "event_type", MAX_EVENT_TYPE_LEN) {
+            return error_result(&e);
+        }
+
+        let user_id = trim_str(args, "user_id");
+        if let Some(ref uid) = user_id {
+            if let Err(e) = validate_length(uid, "user_id", MAX_STRING_LEN) {
+                return error_result(&e);
+            }
+        }
+
+        let session_id = trim_str(args, "session_id");
+        if let Some(ref sid) = session_id {
+            if let Err(e) = validate_length(sid, "session_id", MAX_STRING_LEN) {
+                return error_result(&e);
+            }
+        }
+
         let properties = args
             .get("properties")
             .cloned()
@@ -250,7 +328,7 @@ impl AnalyticsMcpServer {
         {
             Ok(event) => {
                 // Upsert daily aggregate
-                let _ = sqlx::query(
+                if let Err(e) = sqlx::query(
                     r#"INSERT INTO analytics.daily_aggregates (date, event_type, count, unique_users)
                        VALUES (CURRENT_DATE, $1, 1, CASE WHEN $2::text IS NOT NULL THEN 1 ELSE 0 END)
                        ON CONFLICT (date, event_type)
@@ -267,22 +345,58 @@ impl AnalyticsMcpServer {
                 .bind(&event_type)
                 .bind(&user_id)
                 .execute(self.db.pool())
-                .await;
+                .await
+                {
+                    error!(error = %e, event_type = %event_type, "Failed to upsert daily aggregate");
+                }
 
-                info!(event_type = event_type, "Tracked event");
+                info!(event_type = %event_type, id = %event.id, "Tracked event");
                 json_result(&event)
             }
-            Err(e) => error_result(&format!("Failed to track event: {e}")),
+            Err(e) => {
+                error!(error = %e, event_type = %event_type, "Failed to insert event");
+                error_result(&format!("Failed to track event: {e}"))
+            }
         }
     }
 
     async fn handle_query_events(&self, args: &serde_json::Value) -> CallToolResult {
-        let event_type = get_str(args, "event_type");
-        let user_id = get_str(args, "user_id");
-        let session_id = get_str(args, "session_id");
-        let start_date = get_str(args, "start_date");
-        let end_date = get_str(args, "end_date");
-        let limit = get_i64(args, "limit").unwrap_or(100).min(1000);
+        let event_type = trim_str(args, "event_type");
+        let user_id = trim_str(args, "user_id");
+        let session_id = trim_str(args, "session_id");
+        let start_date = trim_str(args, "start_date");
+        let end_date = trim_str(args, "end_date");
+        let limit = clamp_limit(args, DEFAULT_LIMIT, MAX_LIMIT);
+        let offset = get_offset(args);
+
+        // Validate string lengths
+        if let Some(ref et) = event_type {
+            if let Err(e) = validate_length(et, "event_type", MAX_EVENT_TYPE_LEN) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref uid) = user_id {
+            if let Err(e) = validate_length(uid, "user_id", MAX_STRING_LEN) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref sid) = session_id {
+            if let Err(e) = validate_length(sid, "session_id", MAX_STRING_LEN) {
+                return error_result(&e);
+            }
+        }
+
+        // Validate date formats
+        if let Some(ref sd) = start_date {
+            if let Err(e) = validate_date(sd) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref ed) = end_date {
+            if let Err(e) = validate_date(ed) {
+                return error_result(&e);
+            }
+        }
 
         let mut sql = String::from("SELECT * FROM analytics.events WHERE 1=1");
         let mut bind_idx = 1u32;
@@ -314,20 +428,30 @@ impl AnalyticsMcpServer {
             binds.push(format!("{ed}T00:00:00Z") + " + interval '1 day'");
         }
         sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${bind_idx}"));
-        let _ = bind_idx;
+        bind_idx += 1;
+        sql.push_str(&format!(" OFFSET ${bind_idx}"));
 
         let mut query = sqlx::query_as::<_, Event>(&sql);
         for b in &binds {
             query = query.bind(b);
         }
         query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
-            Ok(events) => json_result(&serde_json::json!({
-                "count": events.len(),
-                "events": events
-            })),
-            Err(e) => error_result(&format!("Query failed: {e}")),
+            Ok(events) => {
+                info!(count = events.len(), limit, offset, "query_events returned results");
+                json_result(&serde_json::json!({
+                    "count": events.len(),
+                    "limit": limit,
+                    "offset": offset,
+                    "events": events
+                }))
+            }
+            Err(e) => {
+                error!(error = %e, "query_events failed");
+                error_result(&format!("Query failed: {e}"))
+            }
         }
     }
 
@@ -335,15 +459,40 @@ impl AnalyticsMcpServer {
         let steps: Vec<String> = args
             .get("steps")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
 
         if steps.len() < 2 {
+            warn!(step_count = steps.len(), "funnel_analysis requires at least 2 steps");
             return error_result("Funnel requires at least 2 steps");
         }
 
-        let start_date = get_str(args, "start_date");
-        let end_date = get_str(args, "end_date");
+        // Validate step names
+        for step in &steps {
+            if let Err(e) = validate_length(step, "step event_type", MAX_EVENT_TYPE_LEN) {
+                return error_result(&e);
+            }
+        }
+
+        let start_date = trim_str(args, "start_date");
+        let end_date = trim_str(args, "end_date");
+
+        // Validate date formats
+        if let Some(ref sd) = start_date {
+            if let Err(e) = validate_date(sd) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref ed) = end_date {
+            if let Err(e) = validate_date(ed) {
+                return error_result(&e);
+            }
+        }
 
         let mut date_filter = String::new();
         let mut date_binds: Vec<String> = Vec::new();
@@ -394,10 +543,14 @@ impl AnalyticsMcpServer {
                         prev_users = cnt;
                     }
                 }
-                Err(e) => return error_result(&format!("Funnel query failed at step {}: {e}", i + 1)),
+                Err(e) => {
+                    error!(error = %e, step_index = i + 1, step_name = %step, "Funnel query failed at step");
+                    return error_result(&format!("Funnel query failed at step {}: {e}", i + 1));
+                }
             }
         }
 
+        info!(step_count = steps.len(), "funnel_analysis completed");
         json_result(&serde_json::json!({
             "steps": funnel,
             "total_steps": steps.len()
@@ -405,9 +558,28 @@ impl AnalyticsMcpServer {
     }
 
     async fn handle_daily_metrics(&self, args: &serde_json::Value) -> CallToolResult {
-        let event_type = get_str(args, "event_type");
-        let start_date = get_str(args, "start_date");
-        let end_date = get_str(args, "end_date");
+        let event_type = trim_str(args, "event_type");
+        let start_date = trim_str(args, "start_date");
+        let end_date = trim_str(args, "end_date");
+        let limit = clamp_limit(args, DEFAULT_LIMIT, MAX_LIMIT);
+        let offset = get_offset(args);
+
+        // Validate inputs
+        if let Some(ref et) = event_type {
+            if let Err(e) = validate_length(et, "event_type", MAX_EVENT_TYPE_LEN) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref sd) = start_date {
+            if let Err(e) = validate_date(sd) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref ed) = end_date {
+            if let Err(e) = validate_date(ed) {
+                return error_result(&e);
+            }
+        }
 
         // Compute from raw events for accuracy
         let mut sql = String::from(
@@ -431,28 +603,54 @@ impl AnalyticsMcpServer {
         }
         if let Some(ref ed) = end_date {
             sql.push_str(&format!(" AND created_at < ${bind_idx}::timestamptz + interval '1 day'"));
+            bind_idx += 1;
             binds.push(format!("{ed}T00:00:00Z"));
         }
-        sql.push_str(" GROUP BY created_at::date, event_type ORDER BY date DESC, event_type");
+        sql.push_str(&format!(" GROUP BY created_at::date, event_type ORDER BY date DESC, event_type LIMIT ${bind_idx}"));
+        bind_idx += 1;
+        sql.push_str(&format!(" OFFSET ${bind_idx}"));
 
         let mut query = sqlx::query_as::<_, DailyAggregate>(&sql);
         for b in &binds {
             query = query.bind(b);
         }
+        query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
-            Ok(metrics) => json_result(&serde_json::json!({
-                "count": metrics.len(),
-                "metrics": metrics
-            })),
-            Err(e) => error_result(&format!("Daily metrics query failed: {e}")),
+            Ok(metrics) => {
+                info!(count = metrics.len(), limit, offset, "daily_metrics returned results");
+                json_result(&serde_json::json!({
+                    "count": metrics.len(),
+                    "limit": limit,
+                    "offset": offset,
+                    "metrics": metrics
+                }))
+            }
+            Err(e) => {
+                error!(error = %e, "daily_metrics query failed");
+                error_result(&format!("Daily metrics query failed: {e}"))
+            }
         }
     }
 
     async fn handle_top_events(&self, args: &serde_json::Value) -> CallToolResult {
-        let start_date = get_str(args, "start_date");
-        let end_date = get_str(args, "end_date");
-        let limit = get_i64(args, "limit").unwrap_or(10).min(100);
+        let start_date = trim_str(args, "start_date");
+        let end_date = trim_str(args, "end_date");
+        let limit = clamp_limit(args, DEFAULT_TOP_LIMIT, MAX_TOP_LIMIT);
+        let offset = get_offset(args);
+
+        // Validate date formats
+        if let Some(ref sd) = start_date {
+            if let Err(e) = validate_date(sd) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref ed) = end_date {
+            if let Err(e) = validate_date(ed) {
+                return error_result(&e);
+            }
+        }
 
         let mut sql = String::from(
             "SELECT event_type, COUNT(*) as count FROM analytics.events WHERE 1=1",
@@ -471,27 +669,61 @@ impl AnalyticsMcpServer {
             binds.push(format!("{ed}T00:00:00Z"));
         }
         sql.push_str(&format!(" GROUP BY event_type ORDER BY count DESC LIMIT ${bind_idx}"));
+        bind_idx += 1;
+        sql.push_str(&format!(" OFFSET ${bind_idx}"));
 
         let mut query = sqlx::query_as::<_, EventCount>(&sql);
         for b in &binds {
             query = query.bind(b);
         }
         query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
-            Ok(top) => json_result(&top),
-            Err(e) => error_result(&format!("Top events query failed: {e}")),
+            Ok(top) => {
+                info!(count = top.len(), limit, offset, "top_events returned results");
+                json_result(&serde_json::json!({
+                    "count": top.len(),
+                    "limit": limit,
+                    "offset": offset,
+                    "events": top
+                }))
+            }
+            Err(e) => {
+                error!(error = %e, "top_events query failed");
+                error_result(&format!("Top events query failed: {e}"))
+            }
         }
     }
 
     async fn handle_user_journey(&self, args: &serde_json::Value) -> CallToolResult {
-        let user_id = match get_str(args, "user_id") {
+        let user_id = match trim_str(args, "user_id") {
             Some(u) => u,
-            None => return error_result("Missing required parameter: user_id"),
+            None => {
+                warn!("user_journey called without user_id");
+                return error_result("Missing required parameter: user_id");
+            }
         };
-        let start_date = get_str(args, "start_date");
-        let end_date = get_str(args, "end_date");
-        let limit = get_i64(args, "limit").unwrap_or(500).min(5000);
+        if let Err(e) = validate_length(&user_id, "user_id", MAX_STRING_LEN) {
+            return error_result(&e);
+        }
+
+        let start_date = trim_str(args, "start_date");
+        let end_date = trim_str(args, "end_date");
+        let limit = clamp_limit(args, DEFAULT_JOURNEY_LIMIT, MAX_JOURNEY_LIMIT);
+        let offset = get_offset(args);
+
+        // Validate date formats
+        if let Some(ref sd) = start_date {
+            if let Err(e) = validate_date(sd) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref ed) = end_date {
+            if let Err(e) = validate_date(ed) {
+                return error_result(&e);
+            }
+        }
 
         let mut sql = String::from("SELECT * FROM analytics.events WHERE user_id = $1");
         let mut bind_idx = 2u32;
@@ -508,27 +740,49 @@ impl AnalyticsMcpServer {
             binds.push(format!("{ed}T00:00:00Z"));
         }
         sql.push_str(&format!(" ORDER BY created_at ASC LIMIT ${bind_idx}"));
+        bind_idx += 1;
+        sql.push_str(&format!(" OFFSET ${bind_idx}"));
 
         let mut query = sqlx::query_as::<_, Event>(&sql).bind(&user_id);
         for b in &binds {
             query = query.bind(b);
         }
         query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
-            Ok(events) => json_result(&serde_json::json!({
-                "user_id": user_id,
-                "event_count": events.len(),
-                "journey": events
-            })),
-            Err(e) => error_result(&format!("User journey query failed: {e}")),
+            Ok(events) => {
+                info!(user_id = %user_id, count = events.len(), limit, offset, "user_journey returned results");
+                json_result(&serde_json::json!({
+                    "user_id": user_id,
+                    "event_count": events.len(),
+                    "limit": limit,
+                    "offset": offset,
+                    "journey": events
+                }))
+            }
+            Err(e) => {
+                error!(error = %e, user_id = %user_id, "user_journey query failed");
+                error_result(&format!("User journey query failed: {e}"))
+            }
         }
     }
 
     async fn handle_retention_cohort(&self, args: &serde_json::Value) -> CallToolResult {
-        let start_date = get_str(args, "start_date").unwrap_or_else(|| "2020-01-01".into());
-        let end_date = get_str(args, "end_date").unwrap_or_else(|| "2099-12-31".into());
-        let max_days = get_i64(args, "max_days").unwrap_or(7).min(30) as i32;
+        let start_date = trim_str(args, "start_date").unwrap_or_else(|| "2020-01-01".into());
+        let end_date = trim_str(args, "end_date").unwrap_or_else(|| "2099-12-31".into());
+        let max_days = get_i64(args, "max_days")
+            .unwrap_or(DEFAULT_RETENTION_DAYS)
+            .max(1)
+            .min(MAX_RETENTION_DAYS) as i32;
+
+        // Validate date formats
+        if let Err(e) = validate_date(&start_date) {
+            return error_result(&e);
+        }
+        if let Err(e) = validate_date(&end_date) {
+            return error_result(&e);
+        }
 
         let sql = r#"
             WITH first_seen AS (
@@ -562,20 +816,52 @@ impl AnalyticsMcpServer {
             .fetch_all(self.db.pool())
             .await
         {
-            Ok(rows) => json_result(&serde_json::json!({
-                "cohort_rows": rows.len(),
-                "max_days": max_days,
-                "cohorts": rows
-            })),
-            Err(e) => error_result(&format!("Retention query failed: {e}")),
+            Ok(rows) => {
+                info!(cohort_rows = rows.len(), max_days, "retention_cohort completed");
+                json_result(&serde_json::json!({
+                    "cohort_rows": rows.len(),
+                    "max_days": max_days,
+                    "cohorts": rows
+                }))
+            }
+            Err(e) => {
+                error!(error = %e, "retention_cohort query failed");
+                error_result(&format!("Retention query failed: {e}"))
+            }
         }
     }
 
     async fn handle_export_events(&self, args: &serde_json::Value) -> CallToolResult {
-        let event_type = get_str(args, "event_type");
-        let user_id = get_str(args, "user_id");
-        let start_date = get_str(args, "start_date");
-        let end_date = get_str(args, "end_date");
+        let event_type = trim_str(args, "event_type");
+        let user_id = trim_str(args, "user_id");
+        let start_date = trim_str(args, "start_date");
+        let end_date = trim_str(args, "end_date");
+        let limit = clamp_limit(args, DEFAULT_EXPORT_LIMIT, MAX_EXPORT_LIMIT);
+        let offset = get_offset(args);
+
+        // Validate string lengths
+        if let Some(ref et) = event_type {
+            if let Err(e) = validate_length(et, "event_type", MAX_EVENT_TYPE_LEN) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref uid) = user_id {
+            if let Err(e) = validate_length(uid, "user_id", MAX_STRING_LEN) {
+                return error_result(&e);
+            }
+        }
+
+        // Validate date formats
+        if let Some(ref sd) = start_date {
+            if let Err(e) = validate_date(sd) {
+                return error_result(&e);
+            }
+        }
+        if let Some(ref ed) = end_date {
+            if let Err(e) = validate_date(ed) {
+                return error_result(&e);
+            }
+        }
 
         let mut sql = String::from("SELECT * FROM analytics.events WHERE 1=1");
         let mut bind_idx = 1u32;
@@ -598,24 +884,34 @@ impl AnalyticsMcpServer {
         }
         if let Some(ref ed) = end_date {
             sql.push_str(&format!(" AND created_at < ${bind_idx}::timestamptz + interval '1 day'"));
+            bind_idx += 1;
             binds.push(format!("{ed}T00:00:00Z"));
         }
-        sql.push_str(" ORDER BY created_at ASC");
+        sql.push_str(&format!(" ORDER BY created_at ASC LIMIT ${bind_idx}"));
+        bind_idx += 1;
+        sql.push_str(&format!(" OFFSET ${bind_idx}"));
 
         let mut query = sqlx::query_as::<_, Event>(&sql);
         for b in &binds {
             query = query.bind(b);
         }
+        query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
             Ok(events) => {
-                info!(count = events.len(), "Exported events");
+                info!(count = events.len(), limit, offset, "Exported events");
                 json_result(&serde_json::json!({
                     "exported": events.len(),
+                    "limit": limit,
+                    "offset": offset,
                     "events": events
                 }))
             }
-            Err(e) => error_result(&format!("Export failed: {e}")),
+            Err(e) => {
+                error!(error = %e, "export_events failed");
+                error_result(&format!("Export failed: {e}"))
+            }
         }
     }
 }
@@ -669,7 +965,10 @@ impl ServerHandler for AnalyticsMcpServer {
                 "user_journey" => self.handle_user_journey(&args).await,
                 "retention_cohort" => self.handle_retention_cohort(&args).await,
                 "export_events" => self.handle_export_events(&args).await,
-                _ => error_result(&format!("Unknown tool: {}", request.name)),
+                _ => {
+                    warn!(tool = %request.name, "Unknown tool called");
+                    error_result(&format!("Unknown tool: {}", request.name))
+                }
             };
 
             Ok(result)
