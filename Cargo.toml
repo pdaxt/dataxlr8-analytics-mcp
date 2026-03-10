@@ -5,6 +5,10 @@ edition = "2024"
 description = "Analytics event tracking and funnel analysis MCP server for DataXLR8 platform"
 repository = "https://github.com/pdaxt/dataxlr8-analytics-mcp"
 
+
+[lib]
+name = "dataxlr8_analytics_mcp"
+path = "src/lib.rs"
 [dependencies]
 # MCP SDK
 rmcp = { version = "0.17", features = ["server", "transport-io"] }
